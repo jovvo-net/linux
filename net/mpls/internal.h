@@ -142,6 +142,7 @@ enum mpls_ttl_propagation {
  */
 struct mpls_route { /* next hop label forwarding entry */
 	struct rcu_head		rt_rcu;
+	u32			rt_nhid;
 	u8			rt_protocol;
 	u8			rt_payload_type;
 	u8			rt_max_alen;

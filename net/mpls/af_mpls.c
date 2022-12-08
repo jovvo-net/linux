@@ -12,6 +12,7 @@
 #include <linux/nospec.h>
 #include <linux/vmalloc.h>
 #include <linux/percpu.h>
+#include <linux/lwtunnel.h>
 #include <net/ip.h>
 #include <net/dst.h>
 #include <net/sock.h>
@@ -19,6 +20,7 @@
 #include <net/ip_fib.h>
 #include <net/netevent.h>
 #include <net/ip_tunnels.h>
+#include <net/mpls_iptunnel.h>
 #include <net/netns/generic.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6.h>
@@ -490,6 +492,7 @@ static const struct nla_policy rtm_mpls_policy[RTA_MAX+1] = {
 struct mpls_route_config {
 	u32			rc_protocol;
 	u32			rc_ifindex;
+	u32			rc_nhid;
 	u8			rc_via_table;
 	u8			rc_via_alen;
 	u8			rc_via[MAX_VIA_ALEN];
@@ -881,6 +884,101 @@ static u8 mpls_count_nexthops(struct rtnexthop *rtnh, int len,
 	return remaining > 0 ? 0 : nhs;
 }
 
+static u8 mpls_count_nh_from_grp(struct net *net,
+				struct nexthop *ip_nh,
+			    u8 *max_via_alen, u8 *max_labels)
+{
+	struct mpls_iptunnel_encap *tun_encap;
+	struct lwtunnel_state *lwtstate;
+	struct nexthop *ip_nh_entry;
+	u8 nhs = 0;
+	int i;
+
+	*max_via_alen = 0;
+	*max_labels = 0;
+
+	for (i = 0; i < ip_nh->nh_grp->num_nh; i++) {
+		ip_nh_entry = ip_nh->nh_grp->nh_entries[i].nh;
+
+		switch (ip_nh_entry->nh_info->fib_nhc.nhc_gw_family) {
+		case AF_INET:
+			if (*max_via_alen < 4)
+				*max_via_alen = 4;
+			break;
+		case AF_INET6:
+			if (*max_via_alen < 16)
+				*max_via_alen = 16;
+			break;
+		default:
+			break;
+		}
+
+		if (ip_nh_entry->nh_info->fib_nhc.nhc_lwtstate) {
+			lwtstate = (struct lwtunnel_state *)
+				ip_nh_entry->nh_info->fib_nhc.nhc_lwtstate;
+
+			if (lwtstate->type != LWTUNNEL_ENCAP_MPLS)
+				goto out;
+
+			tun_encap = (struct mpls_iptunnel_encap *)lwtstate->data;
+
+			if (*max_labels < tun_encap->labels)
+				*max_labels = tun_encap->labels;
+		}
+	}
+
+	nhs = ip_nh->nh_grp->num_nh;
+
+out:
+	return nhs;
+}
+
+static u8 mpls_count_nh_from_nh(struct net *net,
+				struct nexthop *ip_nh,
+			    u8 *max_via_alen, u8 *max_labels)
+{
+	struct mpls_iptunnel_encap *tun_encap;
+	struct lwtunnel_state *lwtstate;
+	u8 nhs = 0;
+
+	*max_via_alen = 0;
+	*max_labels = 0;
+
+	if (!ip_nh)
+		goto out;
+
+	if (ip_nh->is_group) {
+		nhs = mpls_count_nh_from_grp(net, ip_nh, max_via_alen, max_labels);
+		goto out;
+	}
+
+	switch (ip_nh->nh_info->fib_nhc.nhc_gw_family) {
+	case AF_INET:
+		*max_via_alen = 4;
+		break;
+	case AF_INET6:
+		*max_via_alen = 16;
+		break;
+	default:
+		break;
+	}
+
+	if (ip_nh->nh_info->fib_nhc.nhc_lwtstate) {
+		lwtstate = (struct lwtunnel_state *)ip_nh->nh_info->fib_nhc.nhc_lwtstate;
+
+		if (lwtstate->type != LWTUNNEL_ENCAP_MPLS)
+			goto out;
+
+		tun_encap = (struct mpls_iptunnel_encap *)lwtstate->data;
+		*max_labels = tun_encap->labels;
+	}
+
+	nhs = 1;
+
+out:
+	return nhs;
+}
+
 static int mpls_nh_build_multi(struct mpls_route_config *cfg,
 			       struct mpls_route *rt, u8 max_labels,
 			       struct netlink_ext_ack *extack)
@@ -959,12 +1057,138 @@ static bool mpls_label_ok(struct net *net, unsigned int *index,
 	return is_ok;
 }
 
+static int mpls_nh_build_from_grp(struct net *net,
+				struct nexthop *ip_nh, struct mpls_route *rt)
+{
+	struct mpls_iptunnel_encap *tun_encap;
+	struct lwtunnel_state *lwtstate;
+	struct nexthop *ip_nh_entry;
+	int err = -EINVAL;
+
+	change_nexthops(rt) {
+		ip_nh_entry = ip_nh->nh_grp->nh_entries[nhsel].nh;
+
+		if (ip_nh_entry->nh_info->fdb_nh || ip_nh_entry->nh_info->reject_nh)
+			goto errout;
+
+		nh->nh_via_table = MPLS_NEIGH_TABLE_UNSPEC;
+		nh->nh_via_alen = 0;
+
+		switch (ip_nh_entry->nh_info->fib_nhc.nhc_gw_family) {
+		case AF_INET:
+			nh->nh_via_table = NEIGH_ARP_TABLE;
+			nh->nh_via_alen = 4;
+			break;
+		case AF_INET6:
+			nh->nh_via_table = NEIGH_ND_TABLE;
+			nh->nh_via_alen = 16;
+			break;
+		default:
+			nh->nh_via_table = MPLS_NEIGH_TABLE_UNSPEC;
+			nh->nh_via_alen = 0;
+			break;
+		}
+
+		if (ip_nh_entry->nh_info->fib_nhc.nhc_lwtstate) {
+			lwtstate = (struct lwtunnel_state *)
+				ip_nh_entry->nh_info->fib_nhc.nhc_lwtstate;
+
+			if (lwtstate->type != LWTUNNEL_ENCAP_MPLS)
+				goto errout;
+
+			tun_encap = (struct mpls_iptunnel_encap *)lwtstate->data;
+
+			nh->nh_labels = tun_encap->labels;
+			memcpy(nh->nh_label, tun_encap->label,
+							nh->nh_labels * sizeof(u32));
+		}
+
+		if (nh->nh_via_table != MPLS_NEIGH_TABLE_UNSPEC)
+			memcpy(__mpls_nh_via(rt, nh),
+					(u8*) &ip_nh_entry->nh_info->fib_nhc.nhc_gw.ipv6,
+					nh->nh_via_alen);
+
+		err = mpls_nh_assign_dev(net, rt, nh,
+					ip_nh_entry->nh_info->fib_nhc.nhc_oif);
+		if (err)
+			goto errout;
+	} endfor_nexthops(rt);
+
+	rt->rt_nhid = ip_nh->id;
+
+	return 0;
+
+errout:
+	return err;
+}
+
+static int mpls_nh_build_from_nh(struct net *net,
+				struct mpls_route *rt, struct nexthop *ip_nh)
+{
+	struct mpls_iptunnel_encap *tun_encap;
+	struct mpls_nh *nh = rt->rt_nh;
+	struct lwtunnel_state *lwtstate;
+	int err = -EINVAL;
+
+	if (ip_nh->is_group) {
+		err = mpls_nh_build_from_grp(net, ip_nh, rt);
+		goto errout;
+	}
+
+	if (ip_nh->nh_info->fdb_nh || ip_nh->nh_info->reject_nh)
+		goto errout;
+
+	switch (ip_nh->nh_info->fib_nhc.nhc_gw_family) {
+	case AF_INET:
+		nh->nh_via_table = NEIGH_ARP_TABLE;
+		nh->nh_via_alen = 4;
+		break;
+	case AF_INET6:
+		nh->nh_via_table = NEIGH_ND_TABLE;
+		nh->nh_via_alen = 16;
+		break;
+	default:
+		nh->nh_via_table = MPLS_NEIGH_TABLE_UNSPEC;
+		nh->nh_via_alen = 0;
+		break;
+	}
+
+	if (ip_nh->nh_info->fib_nhc.nhc_lwtstate) {
+		lwtstate = (struct lwtunnel_state *)
+				ip_nh->nh_info->fib_nhc.nhc_lwtstate;
+
+		if (lwtstate->type != LWTUNNEL_ENCAP_MPLS)
+			goto errout;
+
+		tun_encap = (struct mpls_iptunnel_encap *)lwtstate->data;
+
+		nh->nh_labels = tun_encap->labels;
+		memcpy(nh->nh_label, tun_encap->label, nh->nh_labels * sizeof(u32));
+	}
+
+	if (nh->nh_via_table != MPLS_NEIGH_TABLE_UNSPEC)
+		memcpy(__mpls_nh_via(rt, nh),
+			(u8*) &ip_nh->nh_info->fib_nhc.nhc_gw.ipv6, nh->nh_via_alen);
+
+	err = mpls_nh_assign_dev(net, rt, nh, ip_nh->nh_info->fib_nhc.nhc_oif);
+	if (err)
+		goto errout;
+
+	rt->rt_nhid = ip_nh->id;
+
+	return 0;
+
+errout:
+	return err;
+}
+
 static int mpls_route_add(struct mpls_route_config *cfg,
 			  struct netlink_ext_ack *extack)
 {
 	struct mpls_route __rcu **platform_label;
 	struct net *net = cfg->rc_nlinfo.nl_net;
 	struct mpls_route *rt, *old;
+	struct nexthop *ip_nh;
 	int err = -EINVAL;
 	u8 max_via_alen;
 	unsigned index;
@@ -1004,6 +1228,11 @@ static int mpls_route_add(struct mpls_route_config *cfg,
 		goto errout;
 
 	err = -EINVAL;
+	if (cfg->rc_mp && cfg->rc_nhid) {
+		NL_SET_ERR_MSG(extack, "MPLS allows one way of nexthop setting only");
+		goto errout;
+	}
+
 	if (cfg->rc_mp) {
 		nhs = mpls_count_nexthops(cfg->rc_mp, cfg->rc_mp_len,
 					  cfg->rc_via_alen, &max_via_alen,
@@ -1014,8 +1243,17 @@ static int mpls_route_add(struct mpls_route_config *cfg,
 		nhs = 1;
 	}
 
+	if (cfg->rc_nhid) {
+		ip_nh = nexthop_find_by_id(net, cfg->rc_nhid);
+		if (ip_nh)
+			nhs = mpls_count_nh_from_nh(net, ip_nh,
+					  &max_via_alen, &max_labels);
+		else
+			nhs = 0;
+	}
+
 	if (nhs == 0) {
-		NL_SET_ERR_MSG(extack, "Route does not contain a nexthop");
+		NL_SET_ERR_MSG(extack, "Route does not contain compatible with MPLS route nexthop");
 		goto errout;
 	}
 
@@ -1029,7 +1267,9 @@ static int mpls_route_add(struct mpls_route_config *cfg,
 	rt->rt_payload_type = cfg->rc_payload_type;
 	rt->rt_ttl_propagate = cfg->rc_ttl_propagate;
 
-	if (cfg->rc_mp)
+	if (cfg->rc_nhid)
+		err = mpls_nh_build_from_nh(net, rt, ip_nh);
+	else if (cfg->rc_mp)
 		err = mpls_nh_build_multi(cfg, rt, max_labels, extack);
 	else
 		err = mpls_nh_build_from_cfg(cfg, rt);
@@ -1062,6 +1302,100 @@ static int mpls_route_del(struct mpls_route_config *cfg,
 
 	err = 0;
 errout:
+	return err;
+}
+
+static void mpls_route_delete_by_nh(struct net *net, struct nexthop *ip_nh)
+{
+	struct mpls_route __rcu **platform_label;
+	size_t platform_labels;
+	struct mpls_route *rt;
+	unsigned int index;
+
+	platform_label = rtnl_dereference(net->mpls.platform_label);
+	platform_labels = net->mpls.platform_labels;
+
+	for (index = MPLS_LABEL_FIRST_UNRESERVED;
+					index < platform_labels; index++) {
+
+		rt = rtnl_dereference(platform_label[index]);
+		if (!rt)
+			continue;
+
+		if (ip_nh->id == rt->rt_nhid)
+			mpls_route_update(net, index, NULL, NULL);
+	}
+
+	return;
+}
+
+static int __mpls_route_update_by_nh(struct net *net,
+			unsigned int index, struct nexthop *ip_nh)
+{
+	struct mpls_route __rcu **platform_label;
+	struct mpls_route *rt, *old;
+	int err = -EINVAL;
+	u8 max_via_alen;
+	u8 max_labels;
+	u8 nhs;
+
+	platform_label = rtnl_dereference(net->mpls.platform_label);
+	old = rtnl_dereference(platform_label[index]);
+
+	nhs = mpls_count_nh_from_nh(net, ip_nh, &max_via_alen, &max_labels);
+
+	if (nhs == 0)
+		goto errout;
+
+	rt = mpls_rt_alloc(nhs, max_via_alen, max_labels);
+	if (IS_ERR(rt)) {
+		err = PTR_ERR(rt);
+		goto errout;
+	}
+
+	rt->rt_protocol = old->rt_protocol;
+	rt->rt_payload_type = old->rt_payload_type;
+	rt->rt_ttl_propagate = old->rt_ttl_propagate;
+
+	err = mpls_nh_build_from_nh(net, rt, ip_nh);
+	if (err)
+		goto freert;
+
+	mpls_route_update(net, index, rt, NULL);
+
+	return 0;
+
+freert:
+	mpls_rt_free(rt);
+errout:
+	return err;
+}
+
+static int mpls_route_update_by_nh(struct net *net, struct nexthop *ip_nh)
+{
+	struct mpls_route __rcu **platform_label;
+	size_t platform_labels;
+	struct mpls_route *rt;
+	unsigned int index;
+	int err = 0;
+
+	platform_label = rtnl_dereference(net->mpls.platform_label);
+	platform_labels = net->mpls.platform_labels;
+
+	for (index = MPLS_LABEL_FIRST_UNRESERVED;
+					index < platform_labels; index++) {
+
+		rt = rtnl_dereference(platform_label[index]);
+		if (!rt)
+			continue;
+
+		if (ip_nh->id == rt->rt_nhid) {
+			err = __mpls_route_update_by_nh(net, index, ip_nh);
+			if (err != 0)
+				break;
+		}
+	}
+
 	return err;
 }
 
@@ -1638,8 +1972,94 @@ static int mpls_dev_notify(struct notifier_block *this, unsigned long event,
 	return NOTIFY_OK;
 }
 
+static int mpls_nexthop_notify(struct notifier_block *nb,
+			       unsigned long event, void *ptr)
+{
+	struct nh_notifier_info *info = ptr;
+	struct nexthop *ip_nh;
+	int ret = NOTIFY_DONE;
+
+	ip_nh = nexthop_find_by_id(info->net, info->id);
+	if (!ip_nh)
+		goto out;
+
+	switch (event) {
+	case NEXTHOP_EVENT_DEL:
+		mpls_route_delete_by_nh(info->net, ip_nh);
+		break;
+	case NEXTHOP_EVENT_REPLACE:
+		/* As far as ip fib nexthop sends NEXTHOP_EVENT_REPLACE notification
+		 * before actual update of the nexthop, we have to build a new
+		 * nexthop/group here and fill necessary data for update of mpls
+		 *route from the struct nh_notifier_info
+		 */
+
+		if (ip_nh->is_group) {
+			struct nexthop *ip_nh_grp, *ip_nh_entry;
+			struct nh_group *nh_grp;
+			int nhsel;
+
+			ip_nh_grp = kzalloc(sizeof(struct nexthop), GFP_KERNEL);
+			memcpy(ip_nh_grp, ip_nh, sizeof(struct nexthop));
+
+			nh_grp = kzalloc(sizeof(struct nh_group)
+					+ sizeof(struct nh_grp_entry) * info->nh_grp->num_nh,
+					GFP_KERNEL);
+			ip_nh_grp->nh_grp = nh_grp;
+
+			nh_grp->num_nh = info->nh_grp->num_nh;
+			for (nhsel = 0; nhsel < info->nh_grp->num_nh; nhsel++) {
+				ip_nh_entry = nexthop_find_by_id(info->net,
+						info->nh_grp->nh_entries[nhsel].id);
+				nh_grp->nh_entries[nhsel].nh = ip_nh_entry;
+			}
+
+			if (mpls_route_update_by_nh(info->net, ip_nh_grp))
+				ret = NOTIFY_BAD;
+
+			kfree(nh_grp);
+			kfree(ip_nh_grp);
+		} else {
+			struct nexthop *ip_nh_new;
+			struct nh_info *nh_info;
+
+			ip_nh_new = kzalloc(sizeof(struct nexthop), GFP_KERNEL);
+			memcpy(ip_nh_new, ip_nh, sizeof(struct nexthop));
+
+			nh_info = kzalloc(sizeof(struct nh_info), GFP_KERNEL);
+			ip_nh_new->nh_info = nh_info;
+
+			nh_info->fib_nhc.nhc_gw_family = info->nh->gw_family;
+			nh_info->fib_nhc.nhc_oif = info->nh->dev->ifindex;
+			memcpy((u8*) &nh_info->fib_nhc.nhc_gw.ipv6,
+					(u8*) &info->nh->ipv6, sizeof(struct in6_addr));
+			nh_info->reject_nh = info->nh->is_reject;
+			nh_info->fdb_nh = info->nh->is_fdb;
+			nh_info->fib_nhc.nhc_lwtstate = info->nh->lwtstate;
+			ip_nh_new->nh_info = nh_info;
+
+			if (mpls_route_update_by_nh(info->net, ip_nh_new))
+				ret = NOTIFY_BAD;
+
+			kfree(nh_info);
+			kfree(ip_nh_new);
+		}
+
+		break;
+	default:
+		break;
+	}
+
+out:
+	return ret;
+}
+
 static struct notifier_block mpls_dev_notifier = {
 	.notifier_call = mpls_dev_notify,
+};
+
+static struct notifier_block mpls_nexthop_notifier = {
+	.notifier_call = mpls_nexthop_notify,
 };
 
 static int nla_put_via(struct sk_buff *skb,
@@ -1895,6 +2315,11 @@ static int rtm_to_route_config(struct sk_buff *skb,
 				MPLS_TTL_PROP_DISABLED;
 			break;
 		}
+		case RTA_NH_ID:
+		{
+			cfg->rc_nhid = nla_get_u32(nla);
+			break;
+		}
 		default:
 			NL_SET_ERR_MSG_ATTR(extack, nla, "Unknown attribute");
 			/* Unsupported attribute */
@@ -1983,6 +2408,8 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 			       ttl_propagate))
 			goto nla_put_failure;
 	}
+	if (rt->rt_nhid)
+		nla_put_u32(skb, RTA_NH_ID, rt->rt_nhid);
 	if (rt->rt_nhn == 1) {
 		const struct mpls_nh *nh = rt->rt_nh;
 
@@ -2664,7 +3091,7 @@ static int mpls_net_init(struct net *net)
 		return -ENOMEM;
 	}
 
-	return 0;
+	return register_nexthop_notifier(net, &mpls_nexthop_notifier, NULL);
 }
 
 static void mpls_net_exit(struct net *net)
@@ -2677,6 +3104,8 @@ static void mpls_net_exit(struct net *net)
 	table = net->mpls.ctl->ctl_table_arg;
 	unregister_net_sysctl_table(net->mpls.ctl);
 	kfree(table);
+
+	unregister_nexthop_notifier(net, &mpls_nexthop_notifier);
 
 	/* An rcu grace period has passed since there was a device in
 	 * the network namespace (and thus the last in flight packet)

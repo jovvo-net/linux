@@ -176,6 +176,7 @@ struct nh_notifier_single_info {
 	u8 is_reject:1,
 	   is_fdb:1,
 	   has_encap:1;
+	struct lwtunnel_state *lwtstate;
 };
 
 struct nh_notifier_grp_entry_info {

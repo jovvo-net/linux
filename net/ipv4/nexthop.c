@@ -94,6 +94,7 @@ __nh_notifier_single_info_init(struct nh_notifier_single_info *nh_info,
 	nh_info->is_reject = nhi->reject_nh;
 	nh_info->is_fdb = nhi->fdb_nh;
 	nh_info->has_encap = !!nhi->fib_nhc.nhc_lwtstate;
+	nh_info->lwtstate = nhi->fib_nhc.nhc_lwtstate;
 }
 
 static int nh_notifier_single_info_init(struct nh_notifier_info *info,
